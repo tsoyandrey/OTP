@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TOTP in browser — Offline</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "SF Pro Text"; background:#0b1020; color:#e8ecf1; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
+  .card { background:#0f1724; padding:24px; border-radius:12px; box-shadow: 0 6px 30px rgba(0,0,0,0.7); width:420px; }
+  h1 { margin:0 0 12px 0; font-size:18px; color:#9aa8b4; }
+  .big { font-size:48px; letter-spacing:6px; margin:12px 0; }
+  input[type=text], textarea { width:100%; padding:10px; border-radius:8px; border:1px solid #203042; background:#07101a; color:#e8ecf1; font-family:monospace; }
+  .row { display:flex; gap:8px; align-items:center; }
+  button { padding:10px 12px; border-radius:8px; border:0; background:#1a2333; color:#e8ecf1; cursor:pointer; }
+  .muted { color:#9aa8b4; font-size:13px; margin-top:8px; }
+  .status { color:#6dd5ed; font-size:13px; margin-top:8px; }
+</style>
+<body>
+  <div class="card">
+    <h1>TOTP 2FA (в браузере — Offline)</h1>
+
+    <label>Секрет / otpauth:// URI</label>
+    <textarea id="secret" rows="3" placeholder="Вставьте secret (Base32/Hex/Base64) или otpauth://..." ></textarea>
+    <div style="height:10px;"></div>
+    <div class="row">
+      <div style="flex:1">
+        <div class="big" id="code">······</div>
+        <div class="muted" id="details">Введите секрет…</div>
+      </div>
+      <div style="width:120px;text-align:right">
+        <div id="timer" class="status">Обновление: 00с</div>
+        <div style="height:6px"></div>
+        <button id="copy">Копировать</button>
+        <div style="height:6px"></div>
+        <button id="example">Пример</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+/* Minimal Base32 decoder + TOTP using Web Crypto (HMAC-SHA1/256/512 supported by changing algo) */
+
+/* --- Helper: base32 decode (RFC4648) --- */
+function base32ToBytes(s) {
+  if (!s) return new Uint8Array();
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  s = s.toUpperCase().replace(/=+$/,'').replace(/[^A-Z2-7]/g,'');
+  let bits = 0, value = 0, index = 0;
+  const out = [];
+  for (let i=0;i<s.length;i++){
+    value = (value << 5) | alphabet.indexOf(s[i]);
+    bits += 5;
+    if (bits >= 8) {
+      out.push((value >>> (bits - 8)) & 0xFF);
+      bits -= 8;
+    }
+  }
+  return new Uint8Array(out);
+}
+
+/* --- Parse otpauth:// URI if provided --- */
+function parseOtpauth(uri) {
+  try {
+    if (!uri.toLowerCase().startsWith('otpauth://')) return null;
+    const u = new URL(uri);
+    const params = {};
+    for (const [k,v] of u.searchParams) params[k.toLowerCase()] = v;
+    const secret = params.secret || null;
+    const digits = parseInt(params.digits || '6',10);
+    const period = parseInt(params.period || '30',10);
+    const algorithm = (params.algorithm || 'SHA1').toUpperCase();
+    return {secret, digits, period, algorithm};
+  } catch(e) {
+    return null;
+  }
+}
+
+/* --- Convert integer counter to 8-byte big-endian --- */
+function counterToBuffer(counter) {
+  const buf = new ArrayBuffer(8);
+  const view = new DataView(buf);
+  // set high 32 bits and low 32 bits
+  const hi = Math.floor(counter / 0x100000000);
+  const lo = counter & 0xFFFFFFFF;
+  view.setUint32(0, hi);
+  view.setUint32(4, lo);
+  return new Uint8Array(buf);
+}
+
+/* --- HMAC via Web Crypto --- */
+async function hmacSha(algorithm, keyBytes, msg) {
+  // algorithm: "SHA-1" | "SHA-256" | "SHA-512"
+  const key = await crypto.subtle.importKey('raw', keyBytes, {name:'HMAC', hash:{name:algorithm}}, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, msg);
+  return new Uint8Array(sig);
+}
+
+/* --- TOTP compute --- */
+async function totpFromKey(keyBytes, timeSec, digits=6, period=30, algo='SHA1') {
+  const algoName = (algo || 'SHA1').toUpperCase();
+  const hashName = algoName === 'SHA256' ? 'SHA-256' : algoName === 'SHA512' ? 'SHA-512' : 'SHA-1';
+  const counter = Math.floor(timeSec / period);
+  const msg = counterToBuffer(counter);
+  const hmac = await hmacSha(hashName, keyBytes, msg);
+  const offset = hmac[hmac.length - 1] & 0x0f;
+  const codeBytes = hmac.slice(offset, offset+4);
+  let dbc = ((codeBytes[0] & 0x7f) << 24) | (codeBytes[1] << 16) | (codeBytes[2] << 8) | codeBytes[3];
+  const mod = 10 ** digits;
+  const code = (dbc % mod).toString().padStart(digits, '0');
+  return code;
+}
+
+/* --- Auto decode secret (Base32/Base64/Hex) --- */
+function tryDecodeSecret(raw) {
+  raw = raw.trim();
+  if (!raw) throw "EMPTY";
+  // otpauth?
+  const oa = parseOtpauth(raw);
+  if (oa && oa.secret) {
+    return {key: base32ToBytes(oa.secret), digits: oa.digits || 6, period: oa.period || 30, algo: oa.algorithm || 'SHA1', fmt:'otpauth+Base32'};
+  }
+  // try base32
+  try {
+    const b = base32ToBytes(raw);
+    if (b.length) return {key: b, digits:6, period:30, algo:'SHA1', fmt:'Base32'};
+  } catch(e){}
+  // try hex
+  if (/^[0-9a-fA-F]+$/.test(raw) && raw.length%2===0) {
+    const arr = new Uint8Array(raw.length/2);
+    for (let i=0;i<arr.length;i++) arr[i] = parseInt(raw.substr(i*2,2),16);
+    return {key: arr, digits:6, period:30, algo:'SHA1', fmt:'Hex'};
+  }
+  // try base64
+  try {
+    const bytes = Uint8Array.from(atob(raw), c => c.charCodeAt(0));
+    if (bytes.length) return {key: bytes, digits:6, period:30, algo:'SHA1', fmt:'Base64'};
+  } catch(e){}
+  throw "Неизвестный формат секрета";
+}
+
+/* --- UI wiring --- */
+const secretEl = document.getElementById('secret');
+const codeEl = document.getElementById('code');
+const detailsEl = document.getElementById('details');
+const timerEl = document.getElementById('timer');
+const copyBtn = document.getElementById('copy');
+const exampleBtn = document.getElementById('example');
+
+let state = { keyBytes: null, digits:6, period:30, algo:'SHA1', fmt:'—' };
+
+async function updateOnce() {
+  const raw = secretEl.value;
+  if (!raw.trim()) {
+    state = { keyBytes: null, digits:6, period:30, algo:'SHA1', fmt:'—' };
+    codeEl.textContent = '······';
+    detailsEl.textContent = 'Введите секрет…';
+    return;
+  }
+  try {
+    const res = tryDecodeSecret(raw);
+    state = { keyBytes: res.key, digits: res.digits || 6, period: res.period || 30, algo: res.algo || 'SHA1', fmt: res.fmt || 'Base' };
+    const code = await totpFromKey(state.keyBytes, Date.now()/1000, state.digits, state.period, state.algo);
+    codeEl.textContent = code;
+    detailsEl.textContent = `OK · ${state.fmt} · ${state.keyBytes.length} байт · ${state.algo} · ${state.digits} цифр · период ${state.period}s`;
+  } catch(e) {
+    state.keyBytes = null;
+    codeEl.textContent = 'ERROR';
+    detailsEl.textContent = 'Ошибка: ' + (typeof e === 'string' ? e : (e.message||e));
+  }
+}
+
+async function tick() {
+  const left = state.period - Math.floor(Date.now()/1000) % state.period;
+  timerEl.textContent = `Обновление: ${String(left).padStart(2,'0')}с`;
+  if (state.keyBytes) {
+    try {
+      const code = await totpFromKey(state.keyBytes, Date.now()/1000, state.digits, state.period, state.algo);
+      codeEl.textContent = code;
+    } catch(e) { codeEl.textContent = 'ERROR'; }
+  }
+  setTimeout(tick, 200);
+}
+
+secretEl.addEventListener('input', () => updateOnce());
+copyBtn.addEventListener('click', async () => {
+  const txt = codeEl.textContent;
+  if (!txt || txt.includes('·') || txt==='ERROR') { alert('Код недоступен — введите корректный секрет.'); return; }
+  await navigator.clipboard.writeText(txt);
+  timerEl.textContent = 'Скопировано';
+  setTimeout(()=>{},900);
+});
+exampleBtn.addEventListener('click', () => {
+  // example otpauth URL (Google Authenticator style)
+  secretEl.value = 'otpauth://totp/Example:demo@example.com?secret=JBSWY3DPEHPK3PXP&issuer=Example&algorithm=SHA1&digits=6&period=30';
+  updateOnce();
+});
+
+updateOnce();
+tick();
+</script>
+</body>
+</html>
